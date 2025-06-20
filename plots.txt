@@ -1,0 +1,184 @@
+### main.py ###
+import gym
+import torch
+import numpy as np
+from torch.optim import Adam
+import matplotlib.pyplot as plt
+from utilities import gather_trajectories, calculate_gae, ppo_train_step, ExperienceReplay
+from networks import ConvPolicyNet, ConvValueNet
+from helpers import generate_pendulum_frame
+
+# Setup environment
+env = gym.make('Pendulum-v1')
+action_dim = env.action_space.shape[0]
+obs_dimensions = (3, 64, 64)  
+
+# Hyperparameters
+num_epochs = 30
+steps_per_epoch = 4000
+discount_factor = 0.99
+gae_lambda = 0.95
+clip_limit = 0.2
+policy_learning_rate = 3e-4
+value_learning_rate = 1e-3
+hidden_layers = [64, 64]
+replay_capacity = 10000
+minibatch_size = 64
+
+# Initialize models and optimizers
+policy_model = ConvPolicyNet(obs_dimensions, action_dim, hidden_layers)
+value_model = ConvValueNet(obs_dimensions, hidden_layers)
+policy_optimizer = Adam(policy_model.parameters(), lr=policy_learning_rate)
+value_optimizer = Adam(value_model.parameters(), lr=value_learning_rate)
+replay_memory = ExperienceReplay(replay_capacity)
+
+# Track performance
+performance_curves = {}
+policy_loss_data = {}
+value_loss_data = {}
+
+# Training and evaluation
+experiment_settings = {
+    "clipping_enabled": (True, True),
+    "clipping_disabled": (False, True),
+    "gae_enabled": (True, True),
+    "gae_disabled": (True, False)
+}
+
+for experiment_name, (use_clipping, apply_gae) in experiment_settings.items():
+    reward_curve, policy_loss_curve, value_loss_curve = [], [], []
+
+    for epoch in range(num_epochs):
+        # Gather trajectories with image-based observations
+        trajectory_data = gather_trajectories(env, policy_model, steps_per_epoch, generate_pendulum_frame, stack_size=3)
+
+        for sample in trajectory_data:
+            replay_memory.add(sample)
+
+        sampled_data = replay_memory.sample(minibatch_size)
+        obs_states, actions_taken, computed_advantages, discounted_returns, old_log_probs = calculate_gae(
+            sampled_data, value_model, discount_factor, gae_lambda if apply_gae else 0.0
+        )
+
+        # Policy update
+        pol_loss, _ = ppo_train_step(
+            policy_model, value_model, policy_optimizer, None, obs_states, actions_taken,
+            computed_advantages, discounted_returns, old_log_probs, clip_limit if use_clipping else 1e6
+        )
+
+        # Value function update
+        value_optimizer.zero_grad()
+        val_loss = ((value_model(obs_states)[0] - discounted_returns) ** 2).mean()
+        val_loss.backward()
+        value_optimizer.step()
+
+        avg_reward = np.mean([transition[2] for transition in trajectory_data])
+        reward_curve.append(avg_reward)
+        policy_loss_curve.append(pol_loss)
+        value_loss_curve.append(val_loss.item())
+
+        print(f"{experiment_name} - Epoch {epoch + 1}: Avg Reward: {avg_reward:.2f}")
+
+    performance_curves[experiment_name] = reward_curve
+    policy_loss_data[experiment_name] = policy_loss_curve
+    value_loss_data[experiment_name] = value_loss_curve
+
+# Plot results
+plt.figure(figsize=(16, 10))
+
+# Reward curves
+plt.subplot(2, 2, 1)
+for experiment_name, curve in performance_curves.items():
+    plt.plot(range(1, num_epochs + 1), curve, label=experiment_name)
+plt.xlabel("Epoch")
+plt.ylabel("Cumulative Discounted Reward")
+plt.title("Reward Performance")
+plt.legend()
+
+# Policy loss curves
+plt.subplot(2, 2, 2)
+for experiment_name, curve in policy_loss_data.items():
+    plt.plot(range(1, num_epochs + 1), curve, label=experiment_name)
+plt.xlabel("Epoch")
+plt.ylabel("Policy Loss")
+plt.title("Policy Loss Progression")
+plt.legend()
+
+# Value loss curves (normalized)
+plt.subplot(2, 2, 3)
+for experiment_name, curve in value_loss_data.items():
+    normalized_loss = np.log(np.array(curve) + 1e-5)
+    plt.plot(range(1, num_epochs + 1), normalized_loss, label=experiment_name)
+plt.xlabel("Epoch")
+plt.ylabel("Log(Value Loss)")
+plt.title("Normalized Value Loss")
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# Save models
+torch.save(policy_model.state_dict(), "trained_policy_net.pth")
+torch.save(value_model.state_dict(), "trained_value_net.pth")
+
+### networks.py ###
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class ConvPolicyNet(nn.Module):
+    def __init__(self, input_shape, output_dim, hidden_layers):
+        super().__init__()
+        channels, height, width = input_shape
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        conv_output_size = self._compute_conv_output((channels, height, width))
+        self.fc_mean = nn.Linear(conv_output_size, output_dim)
+        self.log_std = nn.Parameter(-0.5 * torch.ones(output_dim))
+
+    def _compute_conv_output(self, input_shape):
+        sample_tensor = self.conv_layers(torch.zeros(1, *input_shape))
+        return int(np.prod(sample_tensor.size()))
+
+    def forward(self, obs):
+        conv_output = self.conv_layers(obs).view(obs.size(0), -1)
+        action_mean = self.fc_mean(conv_output)
+        action_std = torch.exp(self.log_std)
+        return action_mean, action_std
+
+    def sample_action(self, obs):
+        action_mean, action_std = self(obs)
+        action_dist = torch.distributions.Normal(action_mean, action_std)
+        action_sample = action_dist.sample()
+        action_log_prob = action_dist.log_prob(action_sample).sum(axis=-1)
+        return action_sample.detach().numpy(), action_log_prob.detach()
+
+class ConvValueNet(nn.Module):
+    def __init__(self, input_shape, hidden_layers):
+        super().__init__()
+        channels, height, width = input_shape
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        conv_output_size = self._compute_conv_output((channels, height, width))
+        self.fc_output = nn.Linear(conv_output_size, 1)
+
+    def _compute_conv_output(self, input_shape):
+        sample_tensor = self.conv_layers(torch.zeros(1, *input_shape))
+        return int(np.prod(sample_tensor.size()))
+
+    def forward(self, obs):
+        conv_output = self.conv_layers(obs).view(obs.size(0), -1)
+        return self.fc_output(conv_output)
